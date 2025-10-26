@@ -35,6 +35,9 @@
 
 #include <gst/gst.h>
 #include <gst_bridge/rosimagesink.h>
+#include <jpeglib.h>
+#include <cstdio>
+#include <vector>
 
 GST_DEBUG_CATEGORY_STATIC(rosimagesink_debug_category);
 #define GST_CAT_DEFAULT rosimagesink_debug_category
@@ -59,6 +62,8 @@ enum {
   PROP_ROS_TOPIC,
   PROP_ROS_FRAME_ID,
   PROP_ROS_ENCODING,
+  PROP_COMPRESSED,
+  PROP_COMPRESSION_QUALITY,
 };
 
 /* pad templates */
@@ -109,6 +114,18 @@ static void rosimagesink_class_init(RosimagesinkClass * klass)
       "ros-encoding", "encoding-string", "A hack to flexibly set the encoding string", "",
       (GParamFlags)(G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS)));
 
+  g_object_class_install_property(
+    object_class, PROP_COMPRESSED,
+    g_param_spec_boolean(
+      "compressed", "compressed", "Enable JPEG compression", FALSE,
+      (GParamFlags)(G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS)));
+
+  g_object_class_install_property(
+    object_class, PROP_COMPRESSION_QUALITY,
+    g_param_spec_int(
+      "compression-quality", "compression-quality", "JPEG compression quality (0-100)", 0, 100, 85,
+      (GParamFlags)(G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS)));
+
   //access gstreamer base sink events here
   basesink_class->set_caps =
     GST_DEBUG_FUNCPTR(rosimagesink_setcaps);  //gstreamer informs us what caps we're using.
@@ -130,6 +147,8 @@ static void rosimagesink_init(Rosimagesink * sink)
   sink->frame_id = g_strdup("image_frame");
   sink->encoding = g_strdup("");
   sink->init_caps = g_strdup("");
+  sink->compressed = FALSE;
+  sink->compression_quality = 85;
 }
 
 void rosimagesink_set_property(
@@ -161,6 +180,19 @@ void rosimagesink_set_property(
       sink->encoding = g_value_dup_string(value);
       break;
 
+    case PROP_COMPRESSED:
+      if (ros_base_sink->node_if) {
+        RCLCPP_ERROR(
+          ros_base_sink->node_if->logging->get_logger(), "can't change compression setting once opened");
+      } else {
+        sink->compressed = g_value_get_boolean(value);
+      }
+      break;
+
+    case PROP_COMPRESSION_QUALITY:
+      sink->compression_quality = g_value_get_int(value);
+      break;
+
     default:
       G_OBJECT_WARN_INVALID_PROPERTY_ID(object, property_id, pspec);
       break;
@@ -186,6 +218,14 @@ void rosimagesink_get_property(
       g_value_set_string(value, sink->encoding);
       break;
 
+    case PROP_COMPRESSED:
+      g_value_set_boolean(value, sink->compressed);
+      break;
+
+    case PROP_COMPRESSION_QUALITY:
+      g_value_set_int(value, sink->compression_quality);
+      break;
+
     default:
       G_OBJECT_WARN_INVALID_PROPERTY_ID(object, property_id, pspec);
       break;
@@ -199,8 +239,16 @@ static gboolean rosimagesink_open(RosBaseSink * ros_base_sink)
   GST_DEBUG_OBJECT(sink, "open");
   rclcpp::QoS qos = rclcpp::SensorDataQoS().reliable();  //XXX add a parameter for overrides
 
-  sink->pub = rclcpp::create_publisher<sensor_msgs::msg::Image>(
-    ros_base_sink->node_if->parameters, ros_base_sink->node_if->topics, sink->pub_topic, qos);
+  // Create appropriate publisher based on compression setting
+  if (!sink->compressed) {
+    // Raw image publisher
+    sink->pub = rclcpp::create_publisher<sensor_msgs::msg::Image>(
+      ros_base_sink->node_if->parameters, ros_base_sink->node_if->topics, sink->pub_topic, qos);
+  } else {
+    // Compressed image publisher
+    sink->compressed_pub = rclcpp::create_publisher<sensor_msgs::msg::CompressedImage>(
+      ros_base_sink->node_if->parameters, ros_base_sink->node_if->topics, sink->pub_topic, qos);
+  }
 
   return TRUE;
 }
@@ -211,6 +259,7 @@ static gboolean rosimagesink_close(RosBaseSink * ros_base_sink)
   Rosimagesink * sink = GST_ROSIMAGESINK(ros_base_sink);
   GST_DEBUG_OBJECT(sink, "close");
   sink->pub.reset();
+  sink->compressed_pub.reset();
   return TRUE;
 }
 
@@ -298,30 +347,86 @@ static GstFlowReturn rosimagesink_render(
   RosBaseSink * ros_base_sink, GstBuffer * buf, rclcpp::Time msg_time)
 {
   GstMapInfo info;
-  sensor_msgs::msg::Image msg;
-
   Rosimagesink * sink = GST_ROSIMAGESINK(ros_base_sink);
   GST_DEBUG_OBJECT(sink, "render");
 
-  msg.header.stamp = msg_time;
-  msg.header.frame_id = sink->frame_id;
-
-  //auto msg = sink->pub->borrow_loaned_message();
-  //msg.get().width =
-
-  //fill the blanks
-  msg.width = sink->width;
-  msg.height = sink->height;
-  msg.encoding = sink->encoding;
-  msg.is_bigendian = (sink->endianness == G_BIG_ENDIAN);
-  msg.step = sink->step;
-
   gst_buffer_map(buf, &info, GST_MAP_READ);
-  msg.data.assign(info.data, info.data + info.size);
+
+  
+
+  if (!sink->compressed) {
+    // Publish raw image
+    sensor_msgs::msg::Image msg;
+    msg.header.stamp = msg_time;
+    msg.header.frame_id = sink->frame_id;
+    msg.width = sink->width;
+    msg.height = sink->height;
+    msg.encoding = sink->encoding;
+    msg.is_bigendian = (sink->endianness == G_BIG_ENDIAN);
+    msg.step = sink->step;
+    msg.data.assign(info.data, info.data + info.size);
+    sink->pub->publish(msg);
+  } else {
+    // Publish compressed JPEG image using libjpeg
+    sensor_msgs::msg::CompressedImage compressed_msg;
+    compressed_msg.header.stamp = msg_time;
+    compressed_msg.header.frame_id = sink->frame_id;
+    compressed_msg.format = "jpeg";
+
+    // Create JPEG compression
+    struct jpeg_compress_struct cinfo;
+    struct jpeg_error_mgr jerr;
+    
+    cinfo.err = jpeg_std_error(&jerr);
+    jpeg_create_compress(&cinfo);
+
+    // Set up memory destination
+    unsigned char* jpeg_buffer = nullptr;
+    unsigned long jpeg_size = 0;
+    jpeg_mem_dest(&cinfo, &jpeg_buffer, &jpeg_size);
+
+    // Set compression parameters
+    cinfo.image_width = sink->width;
+    cinfo.image_height = sink->height;
+    cinfo.input_components = 3;  // JPEG output is always RGB (3 components)
+    cinfo.in_color_space = JCS_RGB;
+    
+    jpeg_set_defaults(&cinfo);
+    jpeg_set_quality(&cinfo, sink->compression_quality, TRUE);
+    
+    jpeg_start_compress(&cinfo, TRUE);
+
+    // Convert RGBA to RGB and process row by row
+    std::vector<unsigned char> rgb_row(sink->width * 3);
+    JSAMPROW row_pointer[1];
+    unsigned char* image_data = info.data;
+    
+    while (cinfo.next_scanline < cinfo.image_height) {
+      // Convert RGBA to RGB for current row
+      unsigned char* rgba_row = &image_data[cinfo.next_scanline * sink->step];
+      for (int x = 0; x < sink->width; x++) {
+        rgb_row[x * 3 + 0] = rgba_row[x * 4 + 0]; // R
+        rgb_row[x * 3 + 1] = rgba_row[x * 4 + 1]; // G  
+        rgb_row[x * 3 + 2] = rgba_row[x * 4 + 2]; // B
+        // Skip alpha channel (rgba_row[x * 4 + 3])
+      }
+      
+      row_pointer[0] = rgb_row.data();
+      jpeg_write_scanlines(&cinfo, row_pointer, 1);
+    }
+
+    jpeg_finish_compress(&cinfo);
+    jpeg_destroy_compress(&cinfo);
+
+    // Copy compressed data to ROS message
+    if (jpeg_buffer && jpeg_size > 0) {
+      compressed_msg.data.assign(jpeg_buffer, jpeg_buffer + jpeg_size);
+      free(jpeg_buffer);
+    }
+
+    sink->compressed_pub->publish(compressed_msg);
+  }
+
   gst_buffer_unmap(buf, &info);
-
-  //publish
-  sink->pub->publish(msg);
-
   return GST_FLOW_OK;
 }

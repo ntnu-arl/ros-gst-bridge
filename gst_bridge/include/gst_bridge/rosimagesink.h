@@ -27,6 +27,7 @@
 //include ROS and ROS message formats
 #include <rclcpp/rclcpp.hpp>
 #include <sensor_msgs/msg/image.hpp>
+#include <sensor_msgs/msg/compressed_image.hpp>
 
 G_BEGIN_DECLS
 
@@ -49,8 +50,11 @@ struct _Rosimagesink
   gchar * frame_id;
   gchar * encoding;   //image topic encoding string
   gchar * init_caps;  //optional caps override (used for limited apis)
+  gboolean compressed;         //enable JPEG compression
+  gint compression_quality;    //JPEG compression quality (0-100)
 
   rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr pub;
+  rclcpp::Publisher<sensor_msgs::msg::CompressedImage>::SharedPtr compressed_pub;
 
   int height;
   int width;

@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.5)
 project(gst_bridge)
 
-set(CMAKE_BUILD_TYPE RelWithDebInfo)
+# set(CMAKE_BUILD_TYPE RelWithDebInfo)
 
 # Default to C99
 if(NOT CMAKE_C_STANDARD)
@@ -40,6 +40,9 @@ pkg_search_module(gstreamer-app REQUIRED IMPORTED_TARGET gstreamer-app-1.0)
 pkg_search_module(gstreamer-audio REQUIRED IMPORTED_TARGET gstreamer-audio-1.0)
 pkg_search_module(gstreamer-video REQUIRED IMPORTED_TARGET gstreamer-video-1.0)
 
+# find libjpeg-turbo
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(JPEG REQUIRED libjpeg)
 
 # find glib
 set(glib_components gio gio-unix gobject gthread gmodule)
@@ -72,6 +75,7 @@ target_include_directories(gst_bridge PUBLIC
   $<INSTALL_INTERFACE:include>
   ${GLIB_INCLUDE_DIRS}
   ${GOBJECT_INCLUDE_DIR}
+  ${JPEG_INCLUDE_DIRS}
 )
 target_link_libraries(gst_bridge PUBLIC
   ${rclcpp_LIBRARIES}
@@ -79,6 +83,7 @@ target_link_libraries(gst_bridge PUBLIC
   ${audio_msgs_LIBRARIES}
   ${GLIB_LIBRARIES}
   ${GLIB_GIO_LIBRARIES}
+  ${JPEG_LIBRARIES}
   PkgConfig::gstreamer
   PkgConfig::gstreamer-app
   PkgConfig::gstreamer-audio
@@ -110,6 +115,7 @@ target_include_directories(rosgstbridge PRIVATE
   $<INSTALL_INTERFACE:include>
   ${GLIB_INCLUDE_DIRS}
   ${GOBJECT_INCLUDE_DIR}
+  ${JPEG_INCLUDE_DIRS}
 )
 
 target_link_libraries(rosgstbridge PUBLIC
@@ -120,6 +126,7 @@ target_link_libraries(rosgstbridge PUBLIC
   ${GLIB_LIBRARIES}
   ${GLIB_GIO_LIBRARIES}
   ${GLIB_GOBJECT_LIBRARIES}
+  ${JPEG_LIBRARIES}
   PkgConfig::gstreamer
   PkgConfig::gstreamer-app
   PkgConfig::gstreamer-audio
