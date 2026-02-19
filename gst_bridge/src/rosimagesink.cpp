@@ -69,7 +69,7 @@ enum {
 /* pad templates */
 
 static GstStaticPadTemplate rosimagesink_sink_template = GST_STATIC_PAD_TEMPLATE(
-  "sink", GST_PAD_SINK, GST_PAD_ALWAYS, GST_STATIC_CAPS(ROS_IMAGE_MSG_CAPS));
+  "sink", GST_PAD_SINK, GST_PAD_ALWAYS, GST_STATIC_CAPS(ROS_IMAGE_MSG_CAPS "; image/jpeg"));
 
 /* class initialization */
 
@@ -149,6 +149,7 @@ static void rosimagesink_init(Rosimagesink * sink)
   sink->init_caps = g_strdup("");
   sink->compressed = FALSE;
   sink->compression_quality = 85;
+  sink->input_is_jpeg = FALSE;
 }
 
 void rosimagesink_set_property(
@@ -237,19 +238,8 @@ static gboolean rosimagesink_open(RosBaseSink * ros_base_sink)
 {
   Rosimagesink * sink = GST_ROSIMAGESINK(ros_base_sink);
   GST_DEBUG_OBJECT(sink, "open");
-  rclcpp::QoS qos = rclcpp::SensorDataQoS().reliable();  //XXX add a parameter for overrides
-
-  // Create appropriate publisher based on compression setting
-  if (!sink->compressed) {
-    // Raw image publisher
-    sink->pub = rclcpp::create_publisher<sensor_msgs::msg::Image>(
-      ros_base_sink->node_if->parameters, ros_base_sink->node_if->topics, sink->pub_topic, qos);
-  } else {
-    // Compressed image publisher
-    sink->compressed_pub = rclcpp::create_publisher<sensor_msgs::msg::CompressedImage>(
-      ros_base_sink->node_if->parameters, ros_base_sink->node_if->topics, sink->pub_topic, qos);
-  }
-
+  // Publisher creation is deferred to setcaps() where the actual input format
+  // (raw video vs pre-encoded JPEG) is known, avoiding DDS type conflicts.
   return TRUE;
 }
 
@@ -276,6 +266,24 @@ static gboolean rosimagesink_setcaps(GstBaseSink * gst_base_sink, GstCaps * caps
   const GstVideoFormatInfo * format_info;
 
   GST_DEBUG_OBJECT(sink, "setcaps");
+
+  // Fast path: upstream is already a JPEG encoder (e.g. nvjpegenc).
+  // Skip all video-format parsing and ensure we have a compressed publisher.
+  caps_struct = gst_caps_get_structure(caps, 0);
+  if (g_strcmp0(gst_structure_get_name(caps_struct), "image/jpeg") == 0) {
+    sink->input_is_jpeg = TRUE;
+    if (!sink->compressed_pub) {
+      rclcpp::QoS qos = rclcpp::SensorDataQoS().reliable();
+      sink->pub.reset();  // drop raw publisher first to avoid DDS type conflict
+      sink->compressed_pub = rclcpp::create_publisher<sensor_msgs::msg::CompressedImage>(
+        ros_base_sink->node_if->parameters, ros_base_sink->node_if->topics, sink->pub_topic, qos);
+    }
+    RCLCPP_INFO(
+      ros_base_sink->node_if->logging->get_logger(),
+      "setcaps: JPEG passthrough mode (GPU encoder)");
+    return TRUE;
+  }
+  sink->input_is_jpeg = FALSE;
 
   if (!gst_caps_is_fixed(caps)) {
     RCLCPP_ERROR(ros_base_sink->node_if->logging->get_logger(), "caps is not fixed");
@@ -340,6 +348,20 @@ static gboolean rosimagesink_setcaps(GstBaseSink * gst_base_sink, GstCaps * caps
   sink->endianness = endianness;  // XXX used without init
   //sink->sample_rate = rate;
 
+  // Create the publisher now that we know the output type (deferred from open()).
+  rclcpp::QoS qos = rclcpp::SensorDataQoS().reliable();
+  if (!sink->compressed) {
+    if (!sink->pub) {
+      sink->pub = rclcpp::create_publisher<sensor_msgs::msg::Image>(
+        ros_base_sink->node_if->parameters, ros_base_sink->node_if->topics, sink->pub_topic, qos);
+    }
+  } else {
+    if (!sink->compressed_pub) {
+      sink->compressed_pub = rclcpp::create_publisher<sensor_msgs::msg::CompressedImage>(
+        ros_base_sink->node_if->parameters, ros_base_sink->node_if->topics, sink->pub_topic, qos);
+    }
+  }
+
   return true;
 }
 
@@ -352,9 +374,16 @@ static GstFlowReturn rosimagesink_render(
 
   gst_buffer_map(buf, &info, GST_MAP_READ);
 
-  
-
-  if (!sink->compressed) {
+  if (sink->input_is_jpeg) {
+    // Input is already JPEG-encoded by the GPU (nvjpegenc).
+    // Just wrap the bytes in a CompressedImage message — no CPU encoding.
+    sensor_msgs::msg::CompressedImage compressed_msg;
+    compressed_msg.header.stamp = msg_time;
+    compressed_msg.header.frame_id = sink->frame_id;
+    compressed_msg.format = "jpeg";
+    compressed_msg.data.assign(info.data, info.data + info.size);
+    sink->compressed_pub->publish(compressed_msg);
+  } else if (!sink->compressed) {
     // Publish raw image
     sensor_msgs::msg::Image msg;
     msg.header.stamp = msg_time;

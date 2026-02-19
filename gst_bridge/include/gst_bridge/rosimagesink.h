@@ -52,6 +52,7 @@ struct _Rosimagesink
   gchar * init_caps;  //optional caps override (used for limited apis)
   gboolean compressed;         //enable JPEG compression
   gint compression_quality;    //JPEG compression quality (0-100)
+  gboolean input_is_jpeg;      //true when upstream provides pre-encoded JPEG (e.g. nvjpegenc)
 
   rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr pub;
   rclcpp::Publisher<sensor_msgs::msg::CompressedImage>::SharedPtr compressed_pub;
