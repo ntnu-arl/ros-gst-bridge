@@ -38,6 +38,7 @@
 #include <jpeglib.h>
 #include <cstdio>
 #include <vector>
+#include <pts_meta_map.h>
 
 GST_DEBUG_CATEGORY_STATIC(rosimagesink_debug_category);
 #define GST_CAT_DEFAULT rosimagesink_debug_category
@@ -371,6 +372,26 @@ static GstFlowReturn rosimagesink_render(
   GstMapInfo info;
   Rosimagesink * sink = GST_ROSIMAGESINK(ros_base_sink);
   GST_DEBUG_OBJECT(sink, "render");
+
+  guint64 pts = GST_BUFFER_PTS(buf);
+  FrameMetaData meta;
+
+  if (GST_CLOCK_TIME_IS_VALID(pts) && PtsMetaMap::getInstance().getAndRemoveMeta(pts, meta)) {
+    if (ros_base_sink->node_if) {
+      RCLCPP_INFO(ros_base_sink->node_if->logging->get_logger(),
+                  "Frame PTS: %llu | Exposure: %llu ns | Analog Gain: %f | ISP Digital Gain: %f",
+                  (unsigned long long)pts,
+                  (unsigned long long)meta.exposureTime,
+                  meta.analogGain,
+                  meta.digitalGain);
+    }
+  } else {
+    // If it misses, we log a warning debug to avoid spam, but let you know it dropped
+    if (ros_base_sink->node_if) {
+      RCLCPP_DEBUG(ros_base_sink->node_if->logging->get_logger(),
+                  "Metadata not found in PTS Map for PTS: %llu", (unsigned long long)pts);
+    }
+  }
 
   gst_buffer_map(buf, &info, GST_MAP_READ);
 

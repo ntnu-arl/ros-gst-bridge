@@ -40,6 +40,12 @@ pkg_search_module(gstreamer-app REQUIRED IMPORTED_TARGET gstreamer-app-1.0)
 pkg_search_module(gstreamer-audio REQUIRED IMPORTED_TARGET gstreamer-audio-1.0)
 pkg_search_module(gstreamer-video REQUIRED IMPORTED_TARGET gstreamer-video-1.0)
 
+# find our custom PTS Map library
+find_library(PTS_META_LIB NAMES ptsmetamap PATHS /usr/lib)
+if(NOT PTS_META_LIB)
+    message(FATAL_ERROR "Could not find libptsmetamap.so! Did you install it?")
+endif()
+
 # find libjpeg-turbo
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(JPEG REQUIRED libjpeg)
@@ -89,6 +95,7 @@ target_link_libraries(gst_bridge PUBLIC
   PkgConfig::gstreamer-audio
   PkgConfig::gstreamer-base
   PkgConfig::gstreamer-video
+  ${PTS_META_LIB}
 )
 
 
@@ -132,6 +139,7 @@ target_link_libraries(rosgstbridge PUBLIC
   PkgConfig::gstreamer-audio
   PkgConfig::gstreamer-base
   PkgConfig::gstreamer-video
+  ${PTS_META_LIB}
 )
 
 
