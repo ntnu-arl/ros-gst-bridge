@@ -28,6 +28,7 @@
 #include <rclcpp/rclcpp.hpp>
 #include <sensor_msgs/msg/image.hpp>
 #include <sensor_msgs/msg/compressed_image.hpp>
+#include <sensor_msgs/msg/time_reference.hpp>
 
 G_BEGIN_DECLS
 
@@ -56,6 +57,7 @@ struct _Rosimagesink
 
   rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr pub;
   rclcpp::Publisher<sensor_msgs::msg::CompressedImage>::SharedPtr compressed_pub;
+  rclcpp::Publisher<sensor_msgs::msg::TimeReference>::SharedPtr exposure_time_pub;
 
   int height;
   int width;

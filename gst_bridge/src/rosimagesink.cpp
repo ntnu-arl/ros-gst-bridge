@@ -251,6 +251,7 @@ static gboolean rosimagesink_close(RosBaseSink * ros_base_sink)
   GST_DEBUG_OBJECT(sink, "close");
   sink->pub.reset();
   sink->compressed_pub.reset();
+  sink->exposure_time_pub.reset();
   return TRUE;
 }
 
@@ -267,6 +268,13 @@ static gboolean rosimagesink_setcaps(GstBaseSink * gst_base_sink, GstCaps * caps
   const GstVideoFormatInfo * format_info;
 
   GST_DEBUG_OBJECT(sink, "setcaps");
+
+  if (!sink->exposure_time_pub) {
+    std::string exposure_topic = std::string(sink->pub_topic) + "_exposure_time";
+    rclcpp::QoS qos = rclcpp::SensorDataQoS().reliable();
+    sink->exposure_time_pub = rclcpp::create_publisher<sensor_msgs::msg::TimeReference>(
+      ros_base_sink->node_if->parameters, ros_base_sink->node_if->topics, exposure_topic, qos);
+  }
 
   // Fast path: upstream is already a JPEG encoder (e.g. nvjpegenc).
   // Skip all video-format parsing and ensure we have a compressed publisher.
@@ -375,22 +383,37 @@ static GstFlowReturn rosimagesink_render(
 
   guint64 pts = GST_BUFFER_PTS(buf);
   FrameMetaData meta;
+  rclcpp::Time msg_time_corrected = msg_time;
 
   if (GST_CLOCK_TIME_IS_VALID(pts) && PtsMetaMap::getInstance().getAndRemoveMeta(pts, meta)) {
-    if (ros_base_sink->node_if) {
-      RCLCPP_INFO(ros_base_sink->node_if->logging->get_logger(),
-                  "Frame PTS: %llu | Exposure: %llu ns | Analog Gain: %f | ISP Digital Gain: %f",
-                  (unsigned long long)pts,
-                  (unsigned long long)meta.exposureTime,
-                  meta.analogGain,
-                  meta.digitalGain);
-    }
+    // Start of Exposure = Argus SOF - Exposure Time
+    guint64 start_of_exposure_ns = meta.argusTimestamp - meta.exposureTime;
+
+    // Convert the Argus monotonic hardware time into ROS time using the offset
+    msg_time_corrected = rclcpp::Time(
+      start_of_exposure_ns + ros_base_sink->ros_clock_offset, 
+      ros_base_sink->node_if->clock->get_clock()->get_clock_type());
   } else {
     // If it misses, we log a warning debug to avoid spam, but let you know it dropped
     if (ros_base_sink->node_if) {
-      RCLCPP_DEBUG(ros_base_sink->node_if->logging->get_logger(),
+      RCLCPP_WARN(ros_base_sink->node_if->logging->get_logger(),
                   "Metadata not found in PTS Map for PTS: %llu", (unsigned long long)pts);
     }
+  }
+
+  if (sink->exposure_time_pub) {
+    sensor_msgs::msg::TimeReference meta_msg;
+    
+    // Stamp perfectly matches the image stamp
+    meta_msg.header.stamp = msg_time_corrected; 
+    meta_msg.header.frame_id = sink->frame_id;
+    meta_msg.source = "camera_exposure_duration";
+
+    // Convert uint64_t nanoseconds into sec/nanosec for the time_ref field
+    meta_msg.time_ref.sec = meta.exposureTime / 1000000000ULL;
+    meta_msg.time_ref.nanosec = meta.exposureTime % 1000000000ULL;
+
+    sink->exposure_time_pub->publish(meta_msg);
   }
 
   gst_buffer_map(buf, &info, GST_MAP_READ);
@@ -399,7 +422,7 @@ static GstFlowReturn rosimagesink_render(
     // Input is already JPEG-encoded by the GPU (nvjpegenc).
     // Just wrap the bytes in a CompressedImage message — no CPU encoding.
     sensor_msgs::msg::CompressedImage compressed_msg;
-    compressed_msg.header.stamp = msg_time;
+    compressed_msg.header.stamp = msg_time_corrected;
     compressed_msg.header.frame_id = sink->frame_id;
     compressed_msg.format = "jpeg";
     compressed_msg.data.assign(info.data, info.data + info.size);
@@ -407,7 +430,7 @@ static GstFlowReturn rosimagesink_render(
   } else if (!sink->compressed) {
     // Publish raw image
     sensor_msgs::msg::Image msg;
-    msg.header.stamp = msg_time;
+    msg.header.stamp = msg_time_corrected;
     msg.header.frame_id = sink->frame_id;
     msg.width = sink->width;
     msg.height = sink->height;
@@ -419,7 +442,7 @@ static GstFlowReturn rosimagesink_render(
   } else {
     // Publish compressed JPEG image using libjpeg
     sensor_msgs::msg::CompressedImage compressed_msg;
-    compressed_msg.header.stamp = msg_time;
+    compressed_msg.header.stamp = msg_time_corrected;
     compressed_msg.header.frame_id = sink->frame_id;
     compressed_msg.format = "jpeg";
 
