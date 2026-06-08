@@ -38,10 +38,21 @@
 #include <jpeglib.h>
 #include <cstdio>
 #include <vector>
+#include <cmath>
+#include <limits>
+#include <deque>
+#include <mutex>
 #include <pts_meta_map.h>
 
 GST_DEBUG_CATEGORY_STATIC(rosimagesink_debug_category);
 #define GST_CAT_DEFAULT rosimagesink_debug_category
+
+// Define the struct holding C++ objects requiring constructors
+struct RosimagesinkCxxState {
+  std::deque<rclcpp::Time> sync_out_stamps;
+  std::mutex sync_mutex;
+  rclcpp::Subscription<std_msgs::msg::Header>::SharedPtr sync_out_sub;
+};
 
 /* prototypes */
 
@@ -61,6 +72,7 @@ static GstFlowReturn rosimagesink_render(
 enum {
   PROP_0,
   PROP_ROS_TOPIC,
+  PROP_SYNC_TOPIC,
   PROP_ROS_FRAME_ID,
   PROP_ROS_ENCODING,
   PROP_COMPRESSED,
@@ -101,6 +113,12 @@ static void rosimagesink_class_init(RosimagesinkClass * klass)
     object_class, PROP_ROS_TOPIC,
     g_param_spec_string(
       "ros-topic", "pub-topic", "ROS topic to be published on", "gst_image_pub",
+      (GParamFlags)(G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS)));
+
+  g_object_class_install_property(
+    object_class, PROP_SYNC_TOPIC,
+    g_param_spec_string(
+      "sync-topic", "sync-topic", "IMU sync topic to subscribe to", "/sync_out_stamp",
       (GParamFlags)(G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS)));
 
   g_object_class_install_property(
@@ -145,12 +163,16 @@ static void rosimagesink_init(Rosimagesink * sink)
   RosBaseSink * ros_base_sink GST_ROS_BASE_SINK(sink);
   ros_base_sink->node_name = g_strdup("gst_image_sink_node");
   sink->pub_topic = g_strdup("gst_image_pub");
+  sink->sync_topic = g_strdup("/sync_out_stamp");
   sink->frame_id = g_strdup("image_frame");
   sink->encoding = g_strdup("");
   sink->init_caps = g_strdup("");
   sink->compressed = FALSE;
   sink->compression_quality = 85;
   sink->input_is_jpeg = FALSE;
+
+  // Safely construct C++ objects via `new`
+  sink->cxx_state = new RosimagesinkCxxState();
 }
 
 void rosimagesink_set_property(
@@ -169,6 +191,15 @@ void rosimagesink_set_property(
       } else {
         g_free(sink->pub_topic);
         sink->pub_topic = g_value_dup_string(value);
+      }
+      break;
+
+    case PROP_SYNC_TOPIC:
+      if (ros_base_sink->node_if) {
+        RCLCPP_ERROR(ros_base_sink->node_if->logging->get_logger(), "can't change sync topic name once opened");
+      } else {
+        g_free(sink->sync_topic);
+        sink->sync_topic = g_value_dup_string(value);
       }
       break;
 
@@ -212,6 +243,10 @@ void rosimagesink_get_property(
       g_value_set_string(value, sink->pub_topic);
       break;
 
+    case PROP_SYNC_TOPIC:
+      g_value_set_string(value, sink->sync_topic);
+      break;
+
     case PROP_ROS_FRAME_ID:
       g_value_set_string(value, sink->frame_id);
       break;
@@ -251,7 +286,12 @@ static gboolean rosimagesink_close(RosBaseSink * ros_base_sink)
   GST_DEBUG_OBJECT(sink, "close");
   sink->pub.reset();
   sink->compressed_pub.reset();
-  sink->exposure_time_pub.reset();
+  
+  // Safely cleanup C++ state
+  if (sink->cxx_state) {
+    sink->cxx_state->sync_out_stamps.clear();
+    sink->cxx_state->sync_out_sub.reset();
+  }
   return TRUE;
 }
 
@@ -269,11 +309,19 @@ static gboolean rosimagesink_setcaps(GstBaseSink * gst_base_sink, GstCaps * caps
 
   GST_DEBUG_OBJECT(sink, "setcaps");
 
-  if (!sink->exposure_time_pub) {
-    std::string exposure_topic = std::string(sink->pub_topic) + "_exposure_time";
+  // Initialize Subscriber for IMU Sync Stamps
+  if (!sink->cxx_state->sync_out_sub) {
     rclcpp::QoS qos = rclcpp::SensorDataQoS().reliable();
-    sink->exposure_time_pub = rclcpp::create_publisher<sensor_msgs::msg::TimeReference>(
-      ros_base_sink->node_if->parameters, ros_base_sink->node_if->topics, exposure_topic, qos);
+    sink->cxx_state->sync_out_sub = rclcpp::create_subscription<std_msgs::msg::Header>(
+      ros_base_sink->node_if->parameters, 
+      ros_base_sink->node_if->topics, 
+      sink->sync_topic, 
+      qos,
+      [sink](const std_msgs::msg::Header::SharedPtr msg) {
+        std::lock_guard<std::mutex> lock(sink->cxx_state->sync_mutex);
+        sink->cxx_state->sync_out_stamps.push_back(rclcpp::Time(msg->stamp));
+      }
+    );
   }
 
   // Fast path: upstream is already a JPEG encoder (e.g. nvjpegenc).
@@ -389,31 +437,55 @@ static GstFlowReturn rosimagesink_render(
     // Start of Exposure = Argus SOF - Exposure Time
     guint64 start_of_exposure_ns = meta.argusTimestamp - meta.exposureTime;
 
-    // Convert the Argus monotonic hardware time into ROS time using the offset
-    msg_time_corrected = rclcpp::Time(
+    rclcpp::Time approx_pulse_time = rclcpp::Time(
       start_of_exposure_ns + ros_base_sink->ros_clock_offset, 
       ros_base_sink->node_if->clock->get_clock()->get_clock_type());
+
+    rclcpp::Time best_sync;
+    double min_diff = std::numeric_limits<double>::max();
+    bool sync_found = false;
+    const double MAX_SYNC_DIFF = 0.01;
+
+    {
+      std::lock_guard<std::mutex> lock(sink->cxx_state->sync_mutex);
+      if (sink->cxx_state->sync_out_stamps.empty()) {
+        RCLCPP_WARN(ros_base_sink->node_if->logging->get_logger(), "No sync_out stamps available, dropping image");
+        return GST_FLOW_OK; 
+      }
+
+      auto best_it = sink->cxx_state->sync_out_stamps.end();
+      for (auto it = sink->cxx_state->sync_out_stamps.begin(); it != sink->cxx_state->sync_out_stamps.end(); ++it) {
+        double diff = std::abs((approx_pulse_time - *it).seconds());
+        if (diff < min_diff) {
+          min_diff = diff;
+          best_sync = *it;
+          best_it = it;
+          sync_found = true;
+        }
+      }
+      RCLCPP_DEBUG(ros_base_sink->node_if->logging->get_logger(),
+                    "query: %f, deque_size: %ld, deque_start: %f, deque_end: %f, min_diff: %f", approx_pulse_time.seconds(), sink->cxx_state->sync_out_stamps.size(), sink->cxx_state->sync_out_stamps.front().seconds(), sink->cxx_state->sync_out_stamps.back().seconds(), min_diff);
+
+      if (!sync_found || min_diff > MAX_SYNC_DIFF) {
+        RCLCPP_WARN(ros_base_sink->node_if->logging->get_logger(),
+        "No sync_out stamp within threshold (min diff: %.1f ms), dropping image",
+        min_diff * 1000.0);
+        return GST_FLOW_OK;
+      }
+
+      if (best_it != sink->cxx_state->sync_out_stamps.end()) {
+        sink->cxx_state->sync_out_stamps.erase(sink->cxx_state->sync_out_stamps.begin(), std::next(best_it));
+      }
+    }
+
+    rclcpp::Duration exposure_half_dur = rclcpp::Duration::from_nanoseconds(meta.exposureTime / 2);
+    msg_time_corrected = best_sync + exposure_half_dur;
   } else {
-    // If it misses, we log a warning debug to avoid spam, but let you know it dropped
     if (ros_base_sink->node_if) {
       RCLCPP_WARN(ros_base_sink->node_if->logging->get_logger(),
-                  "Metadata not found in PTS Map for PTS: %llu", (unsigned long long)pts);
+                  "Metadata not found in PTS Map for PTS: %llu, dropping image", (unsigned long long)pts);
     }
-  }
-
-  if (sink->exposure_time_pub) {
-    sensor_msgs::msg::TimeReference meta_msg;
-    
-    // Stamp perfectly matches the image stamp
-    meta_msg.header.stamp = msg_time_corrected; 
-    meta_msg.header.frame_id = sink->frame_id;
-    meta_msg.source = "camera_exposure_duration";
-
-    // Convert uint64_t nanoseconds into sec/nanosec for the time_ref field
-    meta_msg.time_ref.sec = meta.exposureTime / 1000000000ULL;
-    meta_msg.time_ref.nanosec = meta.exposureTime % 1000000000ULL;
-
-    sink->exposure_time_pub->publish(meta_msg);
+    return GST_FLOW_OK; 
   }
 
   gst_buffer_map(buf, &info, GST_MAP_READ);

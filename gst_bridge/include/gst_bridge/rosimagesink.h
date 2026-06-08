@@ -28,7 +28,6 @@
 #include <rclcpp/rclcpp.hpp>
 #include <sensor_msgs/msg/image.hpp>
 #include <sensor_msgs/msg/compressed_image.hpp>
-#include <sensor_msgs/msg/time_reference.hpp>
 
 G_BEGIN_DECLS
 
@@ -43,11 +42,15 @@ G_BEGIN_DECLS
 typedef struct _Rosimagesink Rosimagesink;
 typedef struct _RosimagesinkClass RosimagesinkClass;
 
+// Forward declare the C++ state struct
+struct RosimagesinkCxxState;
+
 struct _Rosimagesink
 {
   RosBaseSink parent;
 
   gchar * pub_topic;
+  gchar * sync_topic; 
   gchar * frame_id;
   gchar * encoding;   //image topic encoding string
   gchar * init_caps;  //optional caps override (used for limited apis)
@@ -57,7 +60,9 @@ struct _Rosimagesink
 
   rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr pub;
   rclcpp::Publisher<sensor_msgs::msg::CompressedImage>::SharedPtr compressed_pub;
-  rclcpp::Publisher<sensor_msgs::msg::TimeReference>::SharedPtr exposure_time_pub;
+  
+  // Pointer to our safely constructed C++ objects
+  RosimagesinkCxxState * cxx_state;
 
   int height;
   int width;
